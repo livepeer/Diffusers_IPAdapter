@@ -65,6 +65,82 @@ image = pipe(
 image.save("image.webp", lossless=True, quality=100)
 ```
 
+## FaceID Support
+
+This implementation now supports IPAdapter FaceID models for face-conditioned image generation. FaceID models use face detection and embedding extraction to maintain facial identity across different styles and contexts.
+
+### FaceID Installation
+
+```bash
+pip install insightface onnxruntime-gpu
+```
+
+### FaceID Example
+
+```python
+from diffusers import StableDiffusionPipeline, DDIMScheduler
+import torch
+from PIL import Image
+from ip_adapter.ip_adapter import IPAdapter
+
+device = "cuda"
+
+# Setup pipeline
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5", 
+    torch_dtype=torch.float16
+)
+pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+pipe.to(device)
+
+# Load face image
+face_image = Image.open("path/to/face_image.jpg")
+
+# Initialize IPAdapter with FaceID support
+ip_adapter = IPAdapter(
+    pipe=pipe,
+    ipadapter_ckpt_path="path/to/ip-adapter-faceid_sd15.bin",
+    image_encoder_path="path/to/image_encoder",
+    device=device,
+    insightface_model_name="buffalo_l"  # Enable FaceID
+)
+
+# Generate with face conditioning
+prompt_embeds, negative_embeds = ip_adapter.get_prompt_embeds(
+    images=face_image,
+    prompt="professional headshot, business attire",
+    negative_prompt="blurry, low quality",
+    faceid_v2_weight=2.0  # For FaceID v2 models
+)
+
+# Generate image
+result = pipe(
+    prompt_embeds=prompt_embeds,
+    negative_prompt_embeds=negative_embeds,
+    num_inference_steps=30,
+    guidance_scale=7.5
+)
+result.images[0].save("faceid_result.png")
+```
+
+### Available FaceID Models
+
+- **ip-adapter-faceid_sd15.bin**: Base FaceID model for SD1.5
+- **ip-adapter-faceid-plusv2_sd15.bin**: FaceID Plus v2 with enhanced features
+- **ip-adapter-faceid-portrait-v11_sd15.bin**: Specialized for portrait style transfer
+- **ip-adapter-faceid_sdxl.bin**: FaceID for SDXL models
+- **ip-adapter-faceid-plusv2_sdxl.bin**: FaceID Plus v2 for SDXL
+
+Download from [h94/IP-Adapter-FaceID](https://huggingface.co/h94/IP-Adapter-FaceID).
+
+### Testing FaceID
+
+Run the comprehensive test script with automatic model downloading:
+
+```bash
+python test_faceid_auto_download.py --model-type sd15 --faceid-variant faceid_plus
+```
+
 ## Suggestions/Recommendations
 
 The negatives are important, be sure to add at least "blurry" and possibly more ("low quality" and whatever).
