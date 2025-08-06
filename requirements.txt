@@ -6,3 +6,7 @@ diffusers
 transformers
 accelerate
 safetensors
+insightface
+onnxruntime-gpu
+huggingface-hub
+requests

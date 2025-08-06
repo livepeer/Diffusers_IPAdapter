@@ -2,12 +2,15 @@ import torch
 from diffusers.pipelines.controlnet import MultiControlNetModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from PIL import Image
+from typing import Union, List, Optional
 
 if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
     from .attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor, CNAttnProcessor2_0 as CNAttnProcessor
 else:
     from .attention_processor import IPAttnProcessor, AttnProcessor, CNAttnProcessor
 from .resampler import Resampler
+from .projection_models import create_faceid_projection_model
+from .face_utils import get_insightface_model, prepare_face_conditioning
 
 class ImageProjModel(torch.nn.Module):
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4):
@@ -25,7 +28,7 @@ class ImageProjModel(torch.nn.Module):
         return clip_extra_context_tokens
 
 class IPAdapter:
-    def __init__(self, pipe, ipadapter_ckpt_path, image_encoder_path, device="cuda", dtype=torch.float16, resample=Image.Resampling.LANCZOS):
+    def __init__(self, pipe, ipadapter_ckpt_path, image_encoder_path, device="cuda", dtype=torch.float16, resample=Image.Resampling.LANCZOS, insightface_model_name=None, insightface_providers=None):
         self.pipe = pipe
         self.device = device
         self.dtype = dtype
@@ -41,16 +44,70 @@ class IPAdapter:
         self.heads = 20 if self.is_sdxl and self.is_plus else 12
         self.num_tokens = 16 if self.is_plus else 4
 
+        # detect FaceID features
+        self.is_faceid = self._detect_faceid(ipadapter_model)
+        self.is_faceidv2 = "faceidplusv2" in ipadapter_model or self._detect_kolors_faceid(ipadapter_model)
+        self.is_portrait_unnorm = self._detect_portrait_unnorm(ipadapter_model)
+        
+        # initialize InsightFace if FaceID model
+        self.insightface_model = None
+        if self.is_faceid and insightface_model_name:
+            print(f"IPAdapter.__init__: Loading InsightFace model: {insightface_model_name}")
+            self.insightface_model = get_insightface_model(
+                model_name=insightface_model_name,
+                providers=insightface_providers
+            )
+
         # set image encoder
         self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(image_encoder_path).to(self.device, dtype=self.dtype)
         self.clip_image_processor = CLIPImageProcessor(resample=resample)
 
         # set IPAdapter
         self.set_ip_adapter()
-        self.image_proj_model = self.init_proj() if not self.is_plus else self.init_proj_plus()
+        self.image_proj_model = self._init_projection_model(ipadapter_model)
         self.image_proj_model.load_state_dict(ipadapter_model["image_proj"])
         ip_layers = torch.nn.ModuleList(self.pipe.unet.attn_processors.values())
-        ip_layers.load_state_dict(ipadapter_model["ip_adapter"])
+        
+        # Filter out LoRA keys for FaceID models (they're not needed in diffusers implementation)
+        ip_adapter_state_dict = ipadapter_model["ip_adapter"]
+        if self.is_faceid:
+            filtered_state_dict = {}
+            for key, value in ip_adapter_state_dict.items():
+                if not any(lora_key in key for lora_key in ["lora", "LoRA"]):
+                    filtered_state_dict[key] = value
+            ip_adapter_state_dict = filtered_state_dict
+            
+        ip_layers.load_state_dict(ip_adapter_state_dict)
+    
+    def _detect_faceid(self, ipadapter_model):
+        """Detect if this is a FaceID model."""
+        return "0.to_q_lora.down.weight" in ipadapter_model.get("ip_adapter", {})
+    
+    def _detect_kolors_faceid(self, ipadapter_model):
+        """Detect if this is a Kolors FaceID model."""
+        image_proj = ipadapter_model.get("image_proj", {})
+        return ("perceiver_resampler.layers.0.0.to_out.weight" in image_proj and 
+                image_proj["perceiver_resampler.layers.0.0.to_out.weight"].shape[0] == 4096)
+    
+    def _detect_portrait_unnorm(self, ipadapter_model):
+        """Detect if this is a portrait unnormalized model."""
+        ip_adapter = ipadapter_model.get("ip_adapter", {})
+        return any("portrait_unnorm" in key for key in ip_adapter.keys())
+    
+    def _init_projection_model(self, ipadapter_model):
+        """Initialize appropriate projection model based on model type."""
+        if self.is_faceid:
+            return create_faceid_projection_model(
+                ipadapter_model["image_proj"],
+                cross_attention_dim=self.cross_attention_dim,
+                clip_embeddings_dim=self.image_encoder.config.hidden_size if self.is_plus else self.image_encoder.config.projection_dim,
+                is_sdxl=self.is_sdxl,
+                is_plus=self.is_plus
+            ).to(self.device, dtype=self.dtype)
+        elif self.is_plus:
+            return self.init_proj_plus()
+        else:
+            return self.init_proj()
         
     def init_proj(self):
         image_proj_model = ImageProjModel(
@@ -99,7 +156,12 @@ class IPAdapter:
                 self.pipe.controlnet.set_attn_processor(CNAttnProcessor())
     
     @torch.inference_mode()
-    def get_image_embeds(self, images, negative_images=None):
+    def get_image_embeds(self, images, negative_images=None, faceid_v2_weight=1.0):
+        # Handle FaceID models
+        if self.is_faceid:
+            return self._get_faceid_embeds(images, negative_images, faceid_v2_weight)
+        
+        # Standard IPAdapter processing
         clip_image = self.clip_image_processor(images=images, return_tensors="pt").pixel_values
         clip_image = clip_image.to(self.device, dtype=torch.float16)
 
@@ -128,10 +190,64 @@ class IPAdapter:
         self.set_tokens(num_tokens)
 
         return image_prompt_embeds, negative_image_prompt_embeds
+    
+    @torch.inference_mode()
+    def _get_faceid_embeds(self, images, negative_images=None, faceid_v2_weight=1.0):
+        """Process FaceID embeddings with face detection and conditioning."""
+        if self.insightface_model is None:
+            raise ValueError("_get_faceid_embeds: InsightFace model required for FaceID processing. Initialize with insightface_model_name parameter.")
+        
+        # Extract face embeddings and cropped faces
+        face_embeds, cropped_faces = prepare_face_conditioning(
+            self.insightface_model,
+            images,
+            is_sdxl=self.is_sdxl,
+            is_kolors=self._detect_kolors_faceid({}),  # Simple check
+            normalize_embeddings=not self.is_portrait_unnorm
+        )
+        
+        face_embeds = face_embeds.to(self.device, dtype=self.dtype)
+        
+        # Process cropped faces through CLIP encoder
+        clip_image = self.clip_image_processor(images=cropped_faces, return_tensors="pt").pixel_values
+        clip_image = clip_image.to(self.device, dtype=torch.float16)
+        
+        if self.is_plus:
+            # FaceID Plus: combine face and CLIP embeddings
+            clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+            image_prompt_embeds = self.image_proj_model(
+                face_embeds, clip_image_embeds, 
+                scale=faceid_v2_weight, shortcut=self.is_faceidv2
+            )
+            
+            # Process negative embeddings
+            if negative_images is not None:
+                negative_clip_image = self.clip_image_processor(images=negative_images, return_tensors="pt").pixel_values
+                negative_clip_image = negative_clip_image.to(self.device, dtype=torch.float16)
+                negative_clip_embeds = self.image_encoder(negative_clip_image, output_hidden_states=True).hidden_states[-2]
+                negative_image_prompt_embeds = self.image_proj_model(
+                    torch.zeros_like(face_embeds), negative_clip_embeds,
+                    scale=faceid_v2_weight, shortcut=self.is_faceidv2
+                )
+            else:
+                zero_clip_embeds = self.image_encoder(torch.zeros_like(clip_image), output_hidden_states=True).hidden_states[-2]
+                negative_image_prompt_embeds = self.image_proj_model(
+                    torch.zeros_like(face_embeds), zero_clip_embeds,
+                    scale=faceid_v2_weight, shortcut=self.is_faceidv2
+                )
+        else:
+            # Standard FaceID: use face embeddings only
+            image_prompt_embeds = self.image_proj_model(face_embeds)
+            negative_image_prompt_embeds = self.image_proj_model(torch.zeros_like(face_embeds))
+        
+        num_tokens = image_prompt_embeds.shape[0] * self.num_tokens
+        self.set_tokens(num_tokens)
+        
+        return image_prompt_embeds, negative_image_prompt_embeds
 
     @torch.inference_mode()
-    def get_prompt_embeds(self, images, negative_images=None, prompt=None, negative_prompt=None, weight=[]):
-        prompt_embeds, negative_prompt_embeds = self.get_image_embeds(images, negative_images=negative_images)
+    def get_prompt_embeds(self, images, negative_images=None, prompt=None, negative_prompt=None, weight=[], faceid_v2_weight=1.0):
+        prompt_embeds, negative_prompt_embeds = self.get_image_embeds(images, negative_images=negative_images, faceid_v2_weight=faceid_v2_weight)
 
         if any(e != 1.0 for e in weight):
             weight = torch.tensor(weight).unsqueeze(-1).unsqueeze(-1)
