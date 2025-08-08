@@ -570,9 +570,10 @@ class TRTIPAttnProcessor2_0(nn.Module):
 
 
 def build_layer_weights(num_layers: int, base_weight: float, weight_type: Optional[str]) -> Optional[torch.Tensor]:
-    """Map a weight_type to a per-layer weight vector.
+    """Map a weight_type to a per-layer weight vector (ComfyUI-compatible).
 
-    Returns None to indicate uniform weighting should be used by caller.
+    Returns None to indicate uniform weighting should be used by caller or that
+    the weight_type is purely time-scheduled.
     """
     if not weight_type:
         return None
@@ -580,46 +581,178 @@ def build_layer_weights(num_layers: int, base_weight: float, weight_type: Option
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     w = torch.full((num_layers,), float(base_weight), dtype=torch.float32, device=device)
 
+    # Linear/uniform means caller should use a uniform vector at base_weight
+    if t in ("linear", "uniform", "none"):
+        return None
+
+    # Easing profiles across layers (kept for compatibility)
     if t in ("ease in", "ease-in", "ease_in"):
         for i in range(num_layers):
-            w[i] = base_weight * (0.05 + 0.95 * (1.0 - i / max(1, num_layers)))
+            w[i] = base_weight * (0.05 + 0.95 * (1.0 - i / max(1, num_layers - 1)))
         return w
     if t in ("ease out", "ease-out", "ease_out"):
         for i in range(num_layers):
-            w[i] = base_weight * (0.05 + 0.95 * (i / max(1, num_layers)))
+            w[i] = base_weight * (0.05 + 0.95 * (i / max(1, num_layers - 1)))
         return w
     if t in ("ease in-out", "ease-in-out", "ease_in_out"):
-        mid = num_layers / 2.0
+        mid = (num_layers - 1) / 2.0
         for i in range(num_layers):
             w[i] = base_weight * (0.05 + 0.95 * (1.0 - abs(i - mid) / max(1.0, mid)))
         return w
     if t in ("reverse in-out", "reverse-in-out", "reverse_in_out"):
-        mid = num_layers / 2.0
+        mid = (num_layers - 1) / 2.0
         for i in range(num_layers):
             w[i] = base_weight * (0.05 + 0.95 * (abs(i - mid) / max(1.0, mid)))
         return w
 
-    if t == "style transfer precise":
+    # Layer selection families derived from ComfyUI implementation
+    # SDXL-like architectures typically expose ~11 IP layers; SD1.5 expose 16.
+    if t == "style transfer":
         w.zero_()
         if num_layers == 11:
-            w[3] = base_weight
-        elif num_layers == 16:
-            for idx in (4, 5):
+            # SDXL: focus on style block(s)
+            for idx in (6,):
                 if 0 <= idx < num_layers:
                     w[idx] = base_weight
+        elif num_layers == 16:
+            # SD1.5: down[0..3], up[?] approximated by indices {0,1,2,3,9..15}
+            for idx in (*range(0, 4), *range(9, 16)):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        # Trace for debugging
+        try:
+            import logging
+            logging.getLogger(__name__).debug(f"build_layer_weights: type=style transfer, num_layers={num_layers}, base={base_weight}")
+        except Exception:
+            pass
+        return w
+
+    if t == "composition":
+        w.zero_()
+        if num_layers == 11:
+            for idx in (3,):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        elif num_layers == 16:
+            # Emulate 4: 0.25x, 5: 1.0x
+            if 4 < num_layers:
+                w[4] = 0.25 * base_weight
+            if 5 < num_layers:
+                w[5] = base_weight
+        try:
+            import logging
+            logging.getLogger(__name__).debug(f"build_layer_weights: type=composition, num_layers={num_layers}, base={base_weight}")
+        except Exception:
+            pass
+        return w
+
+    if t == "strong style transfer":
+        w.zero_()
+        if num_layers == 11:
+            for idx in (0, 1, 2, 4, 5, 6, 7, 8, 9, 10):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        elif num_layers == 16:
+            for idx in (0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        return w
+
+    if t == "style and composition":
+        w.zero_()
+        if num_layers == 11:
+            # composition at 3, style at 6
+            for idx in (3, 6):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        elif num_layers == 16:
+            for idx in (0, 1, 2, 3, 5, 9, 10, 11, 12, 13, 14, 15):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+            if 4 < num_layers:
+                w[4] = 0.25 * base_weight
+        return w
+
+    if t == "strong style and composition":
+        w.zero_()
+        if num_layers == 11:
+            for idx in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        elif num_layers == 16:
+            for idx in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        return w
+
+    if t == "style transfer precise":
+        # Approximate with narrow layer selection
+        w.zero_()
+        if num_layers == 11:
+            if 6 < num_layers:
+                w[6] = base_weight
+        elif num_layers == 16:
+            for idx in (*range(0, 4), *range(9, 16)):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        try:
+            import logging
+            logging.getLogger(__name__).debug(f"build_layer_weights: type=style transfer precise, num_layers={num_layers}, base={base_weight}")
+        except Exception:
+            pass
         return w
 
     if t == "composition precise":
+        # Approximate with composition-focused layers only
         w.zero_()
         if num_layers == 11:
-            w[3] = base_weight
+            if 3 < num_layers:
+                w[3] = base_weight
         elif num_layers == 16:
-            for idx in (4, 5):
-                if 0 <= idx < num_layers:
-                    w[idx] = base_weight
+            if 4 < num_layers:
+                w[4] = 0.25 * base_weight
+            if 5 < num_layers:
+                w[5] = base_weight
+        try:
+            import logging
+            logging.getLogger(__name__).debug(f"build_layer_weights: type=composition precise, num_layers={num_layers}, base={base_weight}")
+        except Exception:
+            pass
         return w
 
-    return None
+    # Types that are purely time-scheduled; per-layer vector remains uniform
+    if t in ("weak input", "weak output", "weak middle", "strong middle"):
+        return None
+
+    # Unknown types: raise to signal caller (existing code may handle as uniform)
+    raise ValueError(f"Unsupported weight_type: {weight_type}")
+
+def build_time_weight_factor(weight_type: Optional[str], step_index: int, total_steps: int) -> float:
+    """Per-step time factor for ComfyUI-style schedules.
+
+    Returns multiplicative factor for the current step.
+    """
+    if not weight_type or total_steps <= 1 or step_index < 0:
+        return 1.0
+    t = weight_type.strip().lower()
+    # Normalize position in [0,1]
+    pos = float(step_index) / float(max(1, total_steps - 1))
+
+    if t == "weak input":
+        # small at start, larger at end
+        return 0.2 + 0.8 * pos
+    if t == "weak output":
+        # large at start, smaller at end
+        return 0.2 + 0.8 * (1.0 - pos)
+    if t == "weak middle":
+        # highest at ends, lowest mid
+        return 0.2 + 0.8 * abs(2.0 * pos - 1.0)
+    if t == "strong middle":
+        # lowest at ends, highest mid
+        return 0.2 + 0.8 * (1.0 - abs(2.0 * pos - 1.0))
+
+    # Not a time-driven type
+    return 1.0
 
 ## for controlnet
 class CNAttnProcessor:

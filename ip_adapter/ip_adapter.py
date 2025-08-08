@@ -295,10 +295,15 @@ class IPAdapter:
                 idx = getattr(p, "_ip_layer_index", None)
                 if idx is None:
                     raise RuntimeError("IPAttnProcessor missing _ip_layer_index for per-layer scaling")
-                p.scale = float(scale[idx].item())
+                # Store base scale for time-schedule modulation
+                base_val = float(scale[idx].item())
+                setattr(p, "_base_scale", base_val)
+                p.scale = base_val
         else:
             for p in ip_procs:
-                p.scale = float(scale)
+                base_val = float(scale)
+                setattr(p, "_base_scale", base_val)
+                p.scale = base_val
     
     def set_tokens(self, num_tokens):
         for attn_processor in self.pipe.unet.attn_processors.values():
