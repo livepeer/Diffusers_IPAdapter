@@ -133,6 +133,7 @@ class IPAdapter:
     def set_ip_adapter(self):
         unet = self.pipe.unet
         attn_procs = {}
+        ip_index = 0
         for name in unet.attn_processors.keys():
             cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
             if name.startswith("mid_block"):
@@ -146,7 +147,11 @@ class IPAdapter:
             if cross_attention_dim is None:
                 attn_procs[name] = AttnProcessor()
             else:
-                attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim).to(self.device, dtype=self.dtype)
+                proc = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim).to(self.device, dtype=self.dtype)
+                # track layer index for per-layer scaling in PyTorch mode
+                setattr(proc, "_ip_layer_index", ip_index)
+                ip_index += 1
+                attn_procs[name] = proc
         unet.set_attn_processor(attn_procs)
         if hasattr(self.pipe, "controlnet"):
             if isinstance(self.pipe.controlnet, MultiControlNetModel):
@@ -279,9 +284,21 @@ class IPAdapter:
         return output
 
     def set_scale(self, scale):
-        for attn_processor in self.pipe.unet.attn_processors.values():
-            if isinstance(attn_processor, IPAttnProcessor):
-                attn_processor.scale = scale
+        # Accept scalar or per-layer vector; apply to installed IPAttnProcessors
+        ip_procs = [p for p in self.pipe.unet.attn_processors.values() if isinstance(p, IPAttnProcessor)]
+        if isinstance(scale, (list, tuple, torch.Tensor)):
+            if not isinstance(scale, torch.Tensor):
+                scale = torch.tensor(scale, dtype=torch.float32, device=self.device)
+            if scale.ndim != 1 or scale.shape[0] != len(ip_procs):
+                raise ValueError("set_scale: per-layer scale length must match number of IP layers")
+            for p in ip_procs:
+                idx = getattr(p, "_ip_layer_index", None)
+                if idx is None:
+                    raise RuntimeError("IPAttnProcessor missing _ip_layer_index for per-layer scaling")
+                p.scale = float(scale[idx].item())
+        else:
+            for p in ip_procs:
+                p.scale = float(scale)
     
     def set_tokens(self, num_tokens):
         for attn_processor in self.pipe.unet.attn_processors.values():

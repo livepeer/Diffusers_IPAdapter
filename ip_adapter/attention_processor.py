@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class AttnProcessor(nn.Module):
@@ -391,6 +392,234 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         return hidden_states
 
+
+# TensorRT-compatible IP-Adapter attention processors (used during ONNX export/runtime)
+class TRTIPAttnProcessor(nn.Module):
+    def __init__(self, hidden_size, cross_attention_dim=None, num_tokens=4):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.num_tokens = num_tokens
+        self._scale_index: int = -1
+        self._scale_tensor: torch.Tensor = None  # set at runtime (per-layer scalar)
+
+        self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+        self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+    ):
+        if self._scale_tensor is None:
+            raise RuntimeError("TRTIPAttnProcessor: _scale_tensor must be set before forward")
+
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        else:
+            end_pos = encoder_hidden_states.shape[1] - self.num_tokens
+            encoder_hidden_states, ip_hidden_states = (
+                encoder_hidden_states[:, :end_pos, :],
+                encoder_hidden_states[:, end_pos:, :],
+            )
+            if attn.norm_cross:
+                encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        batch_size, sequence_length, _ = encoder_hidden_states.shape
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # ip branch
+        ip_key = self.to_k_ip(ip_hidden_states)
+        ip_value = self.to_v_ip(ip_hidden_states)
+        ip_key = attn.head_to_batch_dim(ip_key)
+        ip_value = attn.head_to_batch_dim(ip_value)
+        ip_attention_probs = attn.get_attention_scores(query, ip_key, None)
+        ip_hidden_states = torch.bmm(ip_attention_probs, ip_value)
+        ip_hidden_states = attn.batch_to_head_dim(ip_hidden_states)
+
+        scale_tensor = self._scale_tensor.to(dtype=hidden_states.dtype)
+        hidden_states = hidden_states + scale_tensor * ip_hidden_states
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+class TRTIPAttnProcessor2_0(nn.Module):
+    def __init__(self, hidden_size, cross_attention_dim=None, num_tokens=4):
+        super().__init__()
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.num_tokens = num_tokens
+        self._scale_index: int = -1
+        self._scale_tensor: torch.Tensor = None
+
+        self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+        self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+    ):
+        if self._scale_tensor is None:
+            raise RuntimeError("TRTIPAttnProcessor2_0: _scale_tensor must be set before forward")
+
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        else:
+            end_pos = encoder_hidden_states.shape[1] - self.num_tokens
+            encoder_hidden_states, ip_hidden_states = (
+                encoder_hidden_states[:, :end_pos, :],
+                encoder_hidden_states[:, end_pos:, :],
+            )
+            if attn.norm_cross:
+                encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        batch_size, sequence_length, _ = encoder_hidden_states.shape
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        query = attn.to_q(hidden_states)
+        inner_dim = (attn.to_k(encoder_hidden_states)).shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = attn.to_k(encoder_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = attn.to_v(encoder_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # ip branch
+        ip_key = self.to_k_ip(ip_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        ip_value = self.to_v_ip(ip_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        ip_hidden_states = F.scaled_dot_product_attention(
+            query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
+        ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        ip_hidden_states = ip_hidden_states.to(query.dtype)
+
+        scale_tensor = self._scale_tensor.to(dtype=hidden_states.dtype)
+        hidden_states = hidden_states + scale_tensor * ip_hidden_states
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+def build_layer_weights(num_layers: int, base_weight: float, weight_type: Optional[str]) -> Optional[torch.Tensor]:
+    """Map a weight_type to a per-layer weight vector.
+
+    Returns None to indicate uniform weighting should be used by caller.
+    """
+    if not weight_type:
+        return None
+    t = weight_type.strip().lower()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    w = torch.full((num_layers,), float(base_weight), dtype=torch.float32, device=device)
+
+    if t in ("ease in", "ease-in", "ease_in"):
+        for i in range(num_layers):
+            w[i] = base_weight * (0.05 + 0.95 * (1.0 - i / max(1, num_layers)))
+        return w
+    if t in ("ease out", "ease-out", "ease_out"):
+        for i in range(num_layers):
+            w[i] = base_weight * (0.05 + 0.95 * (i / max(1, num_layers)))
+        return w
+    if t in ("ease in-out", "ease-in-out", "ease_in_out"):
+        mid = num_layers / 2.0
+        for i in range(num_layers):
+            w[i] = base_weight * (0.05 + 0.95 * (1.0 - abs(i - mid) / max(1.0, mid)))
+        return w
+    if t in ("reverse in-out", "reverse-in-out", "reverse_in_out"):
+        mid = num_layers / 2.0
+        for i in range(num_layers):
+            w[i] = base_weight * (0.05 + 0.95 * (abs(i - mid) / max(1.0, mid)))
+        return w
+
+    if t == "style transfer precise":
+        w.zero_()
+        if num_layers == 11:
+            w[3] = base_weight
+        elif num_layers == 16:
+            for idx in (4, 5):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        return w
+
+    if t == "composition precise":
+        w.zero_()
+        if num_layers == 11:
+            w[3] = base_weight
+        elif num_layers == 16:
+            for idx in (4, 5):
+                if 0 <= idx < num_layers:
+                    w[idx] = base_weight
+        return w
+
+    return None
 
 ## for controlnet
 class CNAttnProcessor:
